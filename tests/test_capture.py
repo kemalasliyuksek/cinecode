@@ -25,8 +25,55 @@ NODE = os.environ.get("CINECODE_NODE") or shutil.which("node")
 SCRIPT = ROOT / "scripts" / "capture.mjs"
 
 
-def invoke(args, cwd):
-    return subprocess.run([NODE, str(SCRIPT), *args], cwd=cwd, capture_output=True, text=True, timeout=35)
+def invoke(args, cwd, env=None):
+    return subprocess.run([NODE, str(SCRIPT), *args], cwd=cwd, capture_output=True, text=True, timeout=35,
+                          env={**os.environ, **(env or {})})
+
+
+def long_tmpdir(base):
+    """A real folder whose path alone passes the 107 characters a Unix socket path may have."""
+    path = Path(base) / ("a-temp-folder-with-a-long-name-" * 4) / ("and-one-more-level-of-it-" * 4)
+    path.mkdir(parents=True)
+    return path
+
+
+@unittest.skipIf(not NODE or os.name == "nt", "Chrome's socket folder is a Unix matter; Node.js is required")
+class ChromeTempFolder(unittest.TestCase):
+    """Chrome aborts when $TMPDIR/org.chromium.Chromium.XXXXXX/SingletonSocket passes the socket path limit. A stand-in
+    Chrome reports the TMPDIR it was started with, so this runs on every machine and crashes no real browser."""
+    ROOM = 45                                    # /org.chromium.Chromium.XXXXXX/SingletonSocket, the longest brand
+    LIMIT = 103                                  # macOS; Linux allows 107
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="ct-")
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.fake = self.root / "fake-chrome"
+        self.fake.write_text('#!/bin/sh\nprintf "%s" "$TMPDIR" > "$CINECODE_TEST_SEEN"\n'
+                             'if [ -d "$TMPDIR" ]; then : > "$CINECODE_TEST_SEEN.dir"; fi\nexit 1\n', encoding="utf-8")
+        self.fake.chmod(0o755)
+        self.seen = self.root / "seen"
+
+    def started_with(self, tmpdir):
+        result = invoke(["--url", "page.html", "--probe"], self.root,
+                        {"TMPDIR": str(tmpdir), "CHROME_PATH": str(self.fake), "CINECODE_TEST_SEEN": str(self.seen)})
+        self.assertIn("Chrome did not start", result.stderr)     # the stand-in exits; only its TMPDIR matters here
+        return self.seen.read_text(encoding="utf-8")
+
+    def test_a_long_tmpdir_is_replaced_by_a_short_folder_that_exists_and_is_removed_after(self):
+        if not any(os.access(r, os.W_OK) for r in ("/tmp", os.environ.get("XDG_RUNTIME_DIR", ""), "/var/tmp") if r):
+            self.skipTest("no short temp folder is writable here (a sandbox)")
+        given = long_tmpdir(self.root)
+        got = self.started_with(given)
+        self.assertNotEqual(got, str(given))
+        self.assertLessEqual(len(got) + self.ROOM, self.LIMIT, got)
+        self.assertTrue(Path(str(self.seen) + ".dir").exists(), "the short folder did not exist when Chrome started")
+        self.assertFalse(Path(got).exists(), "the short folder was left behind")
+
+    def test_a_short_tmpdir_is_left_as_it_is(self):
+        if len(str(self.root)) + self.ROOM > self.LIMIT:
+            self.skipTest("this machine's own temp folder is long")
+        self.assertEqual(self.started_with(self.root), str(self.root))
 
 
 @unittest.skipUnless(NODE, "Node.js is required")
@@ -92,6 +139,13 @@ class Browser(unittest.TestCase):
         self.cap()
         self.assertIn("0 rendered, 1 skipped", self.cap().stdout)
         self.assertIn("1 rendered, 0 skipped", self.cap("--fresh").stdout)
+
+    @unittest.skipIf(os.name == "nt", "Chrome's socket folder is a Unix matter")
+    def test_renders_under_a_tmpdir_too_long_for_chromes_socket(self):
+        result = invoke(["--url", "index.html", "--out", "frames", "--frames", "0"], self.root,
+                        {"TMPDIR": str(long_tmpdir(self.root))})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertTrue((self.root / "frames/000000.png").is_file())
 
     def test_status_file_does_not_invalidate_inputs(self):
         self.cap("--status", "progress.json")

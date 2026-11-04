@@ -25,7 +25,7 @@
 //                                      Promise<AudioBuffer> (e.g. from OfflineAudioContext.startRendering());
 //                                      written as a 32-bit float WAV (no clipping; master it afterwards).
 //                                      Works alone (audio only) or together with --out / --video.
-// Env: CHROME_PATH=/path/to/chrome to override browser discovery.
+// Env: CHROME_PATH=/path/to/chrome to override browser discovery. A TMPDIR too long for Chrome's socket is handled here.
 // Local frames resume when page/params/loaded local file contents match (not with --video). --fresh regenerates them.
 // HTTP pages render afresh. Local pages with changed unpinned remote assets should use --fresh.
 //
@@ -86,17 +86,24 @@ let done = 0, skipped = 0;
 for (const sig of ['SIGINT', 'SIGTERM']) process.on(sig, () => { Object.assign(status, { state: 'stopped', done, skipped }); writeStatus(); process.exit(130); });
 const browsers = [];                                  // killed on any exit, so no headless Chrome is left running
 const profiles = [];                                  // temp Chrome profiles: removed on any exit, a failed run included
+// Chrome aborts when $TMPDIR/<brand>.XXXXXX/SingletonSocket passes the socket path limit (107 characters on Linux, 103
+// on macOS). The longest brand, org.chromium.Chromium, takes 45 of them, which leaves 58 for TMPDIR.
+const CHROME_TMPDIR_MAX = 58;
+const SHORT_TEMP_ROOTS = ['/tmp', process.env.XDG_RUNTIME_DIR, '/var/tmp'].filter(Boolean);
+let chromeEnvironment = null;
 // Profiles a crash or a kill left behind are removed, so a machine never collects them: a profile carries the pid of
 // the capture that made it and goes only when that process is gone (a long render elsewhere keeps its own); an older
 // unnamed profile goes after six hours.
 const alive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; } };
-try {
-  for (const n of readdirSync(tmpdir())) {
-    if (!n.startsWith('cinecode-chrome-')) continue;
-    const d = join(tmpdir(), n), pid = Number((/^cinecode-chrome-(\d+)-/.exec(n) || [])[1]);
-    if (pid ? !alive(pid) : Date.now() - statSync(d).mtimeMs > 6 * 3600 * 1000) rmSync(d, { recursive: true, force: true });
-  }
-} catch { /* best effort */ }
+for (const root of new Set([tmpdir(), ...(process.platform === 'win32' ? [] : SHORT_TEMP_ROOTS)])) {
+  try {
+    for (const n of readdirSync(root)) {
+      if (!n.startsWith('cinecode-chrome-')) continue;
+      const d = join(root, n), pid = Number((/^cinecode-chrome-(\d+)-/.exec(n) || [])[1]);
+      if (pid ? !alive(pid) : Date.now() - statSync(d).mtimeMs > 6 * 3600 * 1000) rmSync(d, { recursive: true, force: true });
+    }
+  } catch { /* best effort */ }
+}
 process.on('exit', () => {
   for (const p of browsers) { try { p.kill('SIGKILL'); } catch { /* already gone */ } }
   for (const d of profiles) { try { rmSync(d, { recursive: true, force: true }); } catch { /* best effort */ } }
@@ -380,7 +387,7 @@ async function openPage(chromePath, url) {
   ];
   if (process.platform === 'darwin') flags.push('--use-angle=metal');
   flags.push(...extraFlags);
-  const proc = spawn(chromePath, [...flags, url], { stdio: ['ignore', 'ignore', 'pipe'] });
+  const proc = spawn(chromePath, [...flags, url], { stdio: ['ignore', 'ignore', 'pipe'], env: chromeEnv() });
   browsers.push(proc);
   let stderr = '';
   proc.stderr.on('data', (d) => { stderr += d; if (stderr.length > 20000) stderr = stderr.slice(-20000); });
@@ -497,6 +504,22 @@ async function openPage(chromePath, url) {
       try { rmSync(profile, { recursive: true, force: true }); } catch { /* temp browser profile only */ }
     },
   };
+}
+
+// The environment Chrome starts in: this one, or with a short TMPDIR of this run's own when the given one is too long.
+function chromeEnv() {
+  if (process.platform === 'win32' || tmpdir().length <= CHROME_TMPDIR_MAX) return process.env;
+  if (chromeEnvironment) return chromeEnvironment;
+  for (const root of SHORT_TEMP_ROOTS) {
+    if (join(root, `cinecode-chrome-${process.pid}-XXXXXX`).length > CHROME_TMPDIR_MAX) continue;
+    try {
+      const short = mkdtempSync(join(root, `cinecode-chrome-${process.pid}-`));
+      profiles.push(short);
+      return chromeEnvironment = { ...process.env, TMPDIR: short };
+    } catch { /* not writable here: the next one */ }
+  }
+  log(`WARNING: TMPDIR is ${tmpdir().length} characters, too long for Chrome's socket, and no short temp folder is writable; set TMPDIR to a shorter path`);
+  return chromeEnvironment = process.env;
 }
 
 function findChrome() {
