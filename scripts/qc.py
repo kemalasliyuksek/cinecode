@@ -109,16 +109,42 @@ def info(inp, out, say):
     return 0
 
 
+SHEET_PIXELS = 1_000_000                    # the guard refuses images over 1.2 megapixels into the chat
+
+
+def frame_aspect(inp):
+    """Height over width of the first video stream (16:9 when it cannot be read)."""
+    rc, out, _ = call(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height",
+                       "-of", "csv=p=0", inp])
+    try:
+        w, h = (int(x) for x in out.strip().split(",")[:2])
+        return h / w
+    except ValueError:
+        return 9 / 16
+
+
 def sheet(inp, out, say, every="2", cols="6"):
-    n = max(1, math.ceil(duration(inp) / float(every)))
-    cols = min(int(cols), n)
-    rows = math.ceil(n / cols)
+    """A frame every `every` seconds on one sheet under a megapixel: the tiles shrink to 160 px, then the pace slows."""
+    dur, aspect = duration(inp), frame_aspect(inp)
+    tile = 320
+    while True:
+        n = max(1, math.ceil(dur / float(every)))
+        c = min(int(cols), n)
+        rows = math.ceil(n / c)
+        area = (c * (tile + 4) + 4) * (rows * (round(tile * aspect) + 4) + 4)
+        if area <= SHEET_PIXELS:
+            break
+        if tile > 160:
+            tile = max(160, int(tile * (SHEET_PIXELS / area) ** 0.5) // 2 * 2)
+        else:
+            every = f"{float(every) * 1.25:g}"
+    cols = c
     label = (",drawtext=text='%{pts\\:hms}':x=6:y=6:fontsize=18:fontcolor=white:box=1:boxcolor=black@0.5"
              if has_drawtext() else "")
 
     def build(lbl):
         return ["-y", "-i", inp, "-vf", f"select='isnan(prev_selected_t)+gte(t-prev_selected_t\\,{every}-0.001)',"
-                f"scale=320:-2{lbl},tile={cols}x{rows}:padding=4:margin=4", "-fps_mode", "vfr", "-frames:v", "1",
+                f"scale={tile}:-2{lbl},tile={cols}x{rows}:padding=4:margin=4", "-fps_mode", "vfr", "-frames:v", "1",
                 "-update", "1", f"{out}/sheet.jpg"]
     rc, _, err = call(FF + build(label))
     if rc and label:                             # a Windows ffmpeg can have drawtext but find no font: drop the label
@@ -325,7 +351,7 @@ def main(argv):
     out = os.environ.get("QC_OUT", "")
     # outside a film (no STATE.md here or above) the output goes to a temp folder, never into a shelf of films
     if not out and not any(os.path.isfile(p) for p in ("STATE.md", "../STATE.md", "../../STATE.md")):
-        out = os.path.join(tempfile.gettempdir(), "cinecode-qc", name)
+        out = tempfile.mkdtemp(prefix=f"cinecode-qc-{name[:40]}-")   # its own folder: never another run's
     out = out or f"./review/qc-{name}"
     os.makedirs(out, exist_ok=True)
 

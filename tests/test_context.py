@@ -774,7 +774,7 @@ console.log(JSON.stringify({ ahead, farScale: far[2], nearScale: near[2], behind
         self.assertAlmostEqual(usage.cost_of({"input_tokens": 100001}, "claude-haiku-5-5"), 0.0500005)
         self.assertAlmostEqual(usage.cost_of({"output_tokens": 1000}, "claude-opus-5-5"), 0.02)
         self.assertIsNone(usage.cost_of({"input_tokens": 1000}, "claude-unknown-9"))
-        base = "/tmp" if os.path.isdir("/tmp") else tempfile.gettempdir()   # a short base, so the mirrored name is one
+        base = "/tmp" if os.access("/tmp", os.W_OK) else tempfile.gettempdir()   # a short base, so the mirrored name is one
         film = Path(tempfile.mkdtemp(dir=base, prefix="uf"))                # folder; a long TMPDIR would pass 255 chars
         self.addCleanup(shutil.rmtree, film, ignore_errors=True)
         chats = self.root / "chats" / usage.re.sub(r"[^A-Za-z0-9]", "-", str(film.resolve()))
@@ -1538,6 +1538,7 @@ console.log(JSON.stringify({ ahead, farScale: far[2], nearScale: near[2], behind
                             "tool_name": "Read", "tool_input": {"file_path": "/x/.cinecode/keys.env"}})
         def run(path, cache, skill_dir=str(self.root / "kit")):
             env = {"PATH": path, "HOME": str(home), "USERPROFILE": str(home), "CLAUDE_SKILL_DIR": skill_dir,
+                   "CLAUDE_PROJECT_DIR": str(self.root),
                    "CINECODE_PYTHON_CACHE": str(self.root / cache), "CINECODE_GUARD_SEEN": str(self.root / "seen"),
                    "SYSTEMROOT": os.environ.get("SYSTEMROOT", "")}
             return subprocess.run([node, "-e", finders[0], "tool"], input=event, env=env, capture_output=True,
@@ -1571,7 +1572,14 @@ console.log(JSON.stringify({ ahead, farScale: far[2], nearScale: near[2], behind
         self.assertEqual(run(f"{has3}:/bin", "5.txt", skill_dir=""), 0, "no kit found: the guard stays out")
         (home / ".claude" / "skills").mkdir(parents=True)
         shutil.copytree(self.root / "kit", home / ".claude" / "skills" / "cinecode-main")
-        self.assertEqual(run(f"{has3}:/bin", "6.txt", skill_dir=""), 2, "a kit under another folder name is found")
+        self.assertEqual(run(f"{has3}:/bin", "6.txt", skill_dir=""), 0, "another skill's folder is never run by its scripts alone")
+        shutil.copy(ROOT / "SKILL.md", home / ".claude" / "skills" / "cinecode-main" / "SKILL.md")
+        self.assertEqual(run(f"{has3}:/bin", "6.txt", skill_dir=""), 2, "a kit under another folder name is found by its name")
+        shutil.rmtree(home / ".claude" / "skills" / "cinecode-main")
+        project = self.root / ".claude" / "skills" / "other"   # a cloned project brings its own skills: never this kit
+        shutil.copytree(self.root / "kit", project)
+        shutil.copy(ROOT / "SKILL.md", project / "SKILL.md")
+        self.assertEqual(run(f"{has3}:/bin", "9.txt", skill_dir=""), 0, "a project's other skill folders are never searched")
 
     def test_windows_powershell_commands_are_read_like_bash(self):
         sys.path.insert(0, str(ROOT / "scripts"))

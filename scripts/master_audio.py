@@ -100,8 +100,10 @@ def main():
     for attempt in range(4):                     # an encoder can lift sharp peaks well past the limiter: measure, lower
         if float(m["input_lra"]) > a.LRA:
             print(f"WARNING: measured LRA {m['input_lra']} > target {a.LRA}: loudnorm will run in DYNAMIC mode. Raise --LRA.")
+        # ffmpeg reads a measured LRA of 0 (a steady tone, a short clip) as "not measured" and falls back to dynamic
+        # mode, so the smallest real value goes in its place
         af = (f"{pre}loudnorm={target}:measured_I={m['input_i']}:measured_TP={m['input_tp']}:"
-              f"measured_LRA={m['input_lra']}:measured_thresh={m['input_thresh']}:offset={m['target_offset']}:"
+              f"measured_LRA={max(float(m['input_lra']), 0.01):.2f}:measured_thresh={m['input_thresh']}:offset={m['target_offset']}:"
               f"linear=true:print_format=json")
         if a.video:
             dur = lambda f: float(subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of",

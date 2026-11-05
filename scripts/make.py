@@ -89,8 +89,41 @@ def rel(p):
 RUNNING = "make.running"
 
 
+def alive(pid):
+    if os.name == "nt":                      # os.kill(pid, 0) ends a process on Windows; ask for its exit code
+        import ctypes
+        k32, code = ctypes.windll.kernel32, ctypes.c_ulong()
+        h = k32.OpenProcess(0x1000, False, pid)
+        if not h:
+            return False
+        try:
+            return bool(k32.GetExitCodeProcess(h, ctypes.byref(code))) and code.value == 259
+        finally:
+            k32.CloseHandle(h)
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    try:                                     # an ended step its parent has not reaped yet is not running
+        return subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True,
+                              timeout=5).stdout.strip()[:1] != "Z"
+    except (OSError, subprocess.SubprocessError):
+        return True
+
+
 def mark_running(step):
-    """While a step runs, logs/make.running holds its process id, so `make.py wait` waits for this run only."""
+    """While a step runs, logs/make.running holds its process id, so `make.py wait` waits for this run only. A second
+    step on the same film while one runs stops at once: both would take the same version number and the same
+    audio/film.wav, and the file delivered could differ from the one checked."""
+    try:
+        parts = (LOGS / RUNNING).read_text(encoding="utf-8").split()
+        other = int(parts[0])
+    except (OSError, ValueError, IndexError):
+        other = None
+    if other and other != os.getpid() and alive(other):
+        print(f"BUSY: make.py {parts[1] if len(parts) > 1 else 'step'} (process {other}) is still running on this film; "
+              "wait for it (python3 tools/make.py wait), then run this step")
+        sys.exit(1)
     try:
         LOGS.mkdir(exist_ok=True)
         (LOGS / RUNNING).write_text(f"{os.getpid()} {step} {time.time():.3f}\n", encoding="utf-8")
@@ -119,26 +152,6 @@ def wait_cmd(limit):
     already ended, never a later one; with no run marked it shows a summary written in the last minute."""
     t0, end, run = time.time(), time.time() + limit, None
 
-    def alive(pid):
-        if os.name == "nt":                      # os.kill(pid, 0) ends a process on Windows; ask for its exit code
-            import ctypes
-            k32, code = ctypes.windll.kernel32, ctypes.c_ulong()
-            h = k32.OpenProcess(0x1000, False, pid)
-            if not h:
-                return False
-            try:
-                return bool(k32.GetExitCodeProcess(h, ctypes.byref(code))) and code.value == 259
-            finally:
-                k32.CloseHandle(h)
-        try:
-            os.kill(pid, 0)
-        except OSError:
-            return False
-        try:                                     # an ended step its parent has not reaped yet is not running
-            return subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True,
-                                  timeout=5).stdout.strip()[:1] != "Z"
-        except (OSError, subprocess.SubprocessError):
-            return True
     while time.time() < end:
         if run is None:
             try:
@@ -195,6 +208,12 @@ def even(x):
 ASPECT = {"9:16": (1080, 1920), "16:9": (1920, 1080), "1:1": (1080, 1080), "4:5": (1080, 1350), "21:9": (1920, 816)}
 
 
+def fold(text):
+    """Lowercase for matching words in either language: Turkish İ/I/ı and the accents of ü, ö, ç, ş, ğ fold to plain
+    letters (str.lower turns İ into i plus a combining dot, so "DİKEY" would never equal "dikey")."""
+    return text.replace("İ", "i").replace("ı", "i").lower().translate(str.maketrans("üöçşğâîû", "uocsgaiu"))
+
+
 def frame_size(arg):
     if arg:
         m = re.fullmatch(r"(\d+)x(\d+)", arg)
@@ -211,7 +230,7 @@ def frame_size(arg):
                 m = re.search(r"\b(9:16|16:9|1:1|4:5|21:9)\b", line)
                 word = re.search(r"\b(vertical|dikey|square|kare|horizontal|yatay|landscape)\b", line, re.I)
                 ratio = m[1] if m else {"vertical": "9:16", "dikey": "9:16", "square": "1:1", "kare": "1:1"}.get(
-                    word[1].lower(), "16:9") if word else None
+                    fold(word[1]), "16:9") if word else None
                 if ratio:
                     return ASPECT[ratio]
     return None
@@ -405,16 +424,20 @@ CHOICE_WORDS = re.compile(r"\b(silent|sessiz|music[\s-]only|only music|sadece m�
 NOT_CHOICE = re.compile(r"\b(not|no|never|without|değil|yok)\b", re.I)
 
 
-def sound_by_choice(state):
+SILENT_WORDS = re.compile(r"\b(silent|sessiz|no sound|without sound|sessiz film)\b", re.I)
+
+
+def sound_by_choice(state, words=CHOICE_WORDS):
     """A film silent or music-only by choice says so on its card's sound line ("- **Sound (Q4):** music only, by
-    choice", "**Ses / Sound:** sessiz film"); a note elsewhere ("B03 is silent; add the impact") or a negation ("not
-    silent") never waives the sound checks."""
+    choice", "**Ses / Sound:** sessiz film"); a note elsewhere ("B03 is silent; add the impact"), a title ("Sessiz
+    Gece") or a negation ("not silent") never waives the sound checks."""
     for line in state.splitlines():
-        label = re.match(r"\s*[-*]?\s*\*\*([^*]*?)\*\*:?(.*)$", line)
-        if not label or not re.search(r"\b(sound|ses)\b", label[1], re.I):
-            continue
-        for clause in re.split(r"[;,·(]", label[2]):           # "music only; no effects": the "no" is about effects
-            m = CHOICE_WORDS.search(clause)
+        label = re.match(r"\s*[-*]?\s*(?:\*\*([^*]*?)\*\*:?|([^:*]{1,40}):)(.*)$", line)
+        name = label[1] or label[2] if label else ""
+        if not label or not re.search(r"\b(sound|ses)\b", name, re.I) or re.search(r"identity|design|kimli|tasar", name, re.I):
+            continue                                   # the sound line itself, never its identity or design notes
+        for clause in re.split(r"[;,·(]", label[3]):           # "music only; no effects": the "no" is about effects
+            m = words.search(clause)
             if not m:
                 continue
             before = re.findall(r"[\w']+", clause[:m.start()])[-2:]      # "not silent", "not really silent"
@@ -603,12 +626,12 @@ def music_choice_line(film, plan, state):
     body = src[src.find("{", at) + 1:src.find("\n}\n", at)] if at >= 0 else ""
     coded = re.sub(r"//[^\n]*|/\*.*?\*/|\breturn\s*;?", "", body, flags=re.S).strip()
     has_music = bool(own or layers or coded)
-    claim = said.lower()
-    if picked and re.match(r"\s*(none|yok|müzik yok|no music)\b", claim) and has_music:
+    claim = fold(said)
+    if picked and re.match(r"\s*(none|yok|muzik yok|no music)\b", claim) and has_music:
         return ("MUSIC NOT CHOSEN: STATE.md says no music, and the film has music (a score in code, a track or a music "
                 "layer); remove it or ask the user again and write their pick")
     named_file = re.search(r"[\w./\\-]+\.(?:mp3|wav|ogg|flac|m4a|aac)", said)
-    if picked and (re.match(r"\s*(recording|kayıt|own|kendi)\b", claim) or named_file) and coded and not (own or layers):
+    if picked and (re.match(r"\s*(recording|kayit|own|kendi)\b", claim) or named_file) and coded and not (own or layers):
         return ("MUSIC NOT CHOSEN: STATE.md picks a recording, and the film's music is made in code; put the picked "
                 "recording in (Quick: OWN_MUSIC in film.html; Film: a music layer in audio/mix.json) or ask the user again")
     named = picked_files(said)
@@ -1150,7 +1173,10 @@ def credits_file(title, tag):
     kenney = [r for r in rows if "source=kenney" in (r.get("notes") or "")]
     rows = [r for r in rows if r not in kenney]
     def line(r):
-        text = (r.get("attribution_text") or f"\"{r.get('title')}\" by {r.get('author')}, {r.get('licence')}").strip()
+        given = (r.get("attribution_text") or "").strip()
+        if re.fullmatch(r"(none( required)?|n/?a|-|gerekmez|yok)?", given, re.I):   # a CC0 row's "none required"
+            given = f"\"{r.get('title')}\" by {r.get('author')}, {r.get('licence')}"
+        text = given.strip()
         url = (r.get("licence_url") or "").strip()
         return f"{text} ({url})" if url and re.match(r"\s*cc[\s_-]*by", r.get("licence") or "", re.I) and url not in text else text
     lines = list(dict.fromkeys(line(r) for r in rows if (r.get("title") or r.get("attribution_text"))))
@@ -1462,7 +1488,7 @@ def master_summary(m, state):
     silent soundtrack, and whether the final pass ran in dynamic mode."""
     loud = (re.findall(r"re-measured from .*?: I=(\S+) LUFS .*?true peak=(\S+) dBFS", m) or [None])[-1]
     silent = "SILENT SOUNDTRACK" in m
-    chosen = re.search(r"\b(silent|sessiz|no sound|without sound|sessiz film)\b", state, re.I)
+    chosen = sound_by_choice(state, SILENT_WORDS)
     text = ("silent by choice" if chosen else "SILENT SOUNDTRACK (no score, effects or ambience yet)") if silent else \
         f"{loud[0]} LUFS, peak {loud[1]} dBFS" if loud else "loudness: see log"
     squeezed = "normalization_type=dynamic" in ([l for l in m.splitlines() if l.startswith("pass 2:")] or [""])[-1]
@@ -1540,8 +1566,7 @@ def render(a, kind):
         master_in = score
     _, m = step.run([sys.executable, TOOLS / "master_audio.py", master_in, out, "--video", picture, "--limit"], ok=(0, 1))
     loud_txt, silent, squeezed = master_summary(m, state)
-    master_ok = m.rstrip().endswith("OK") and not (silent and not re.search(r"\b(silent|sessiz|no sound|without sound)\b",
-                                                                              state, re.I)) and not squeezed
+    master_ok = m.rstrip().endswith("OK") and not (silent and not sound_by_choice(state, SILENT_WORDS)) and not squeezed
 
     qc_dir = REVIEW / f"qc-{base}"
     every = max(2, math.ceil(dur / 18))         # at most 18 tiles; qc.py all draws the sheet once at this pace
@@ -1579,12 +1604,16 @@ def render(a, kind):
     ending = ending_line(spans + words_before_card(dur), dur)
     unchosen = music_choice_line(PROJECT / film, plan, state)
     rests = rests_line(out, spans, dur, bounds, text_spans()) if out.exists() and kind == "draft" else ""
+    gap = re.search(r"the mix is ([\d.]+) s and the picture ([\d.]+) s", m)
+    gap = abs(float(gap[1]) - float(gap[2])) if gap else 0.0
+    lengths = (f"AUDIO LENGTH: the sound is {gap:.2f} s {'shorter' if 'silence pads' in m else 'longer'} than the "
+               "picture (master_audio.py); fit the mix or the score to the film's length") if gap > 0.1 else ""
     issues += [x for x in (guard_off(), oldcg, avoff, dark, blank, slop, noise, thin, buried, coded, late, copied, text, ending,
-                           unchosen) if x]
+                           unchosen, lengths) if x]
     if end_card:
         rhythm = (rhythm + "\n" if rhythm else "") + end_card
     weak = [i.split(":")[0] for i in issues if i.startswith(("TOO STILL", "TOO REPETITIVE"))] + \
-        (["EVEN RHYTHM"] if "EVEN RHYTHM" in rhythm else []) + (["LONG END CARD"] if end_card else []) + (["TOO DARK"] if dark else []) + (["BLANK FRAMES"] if blank else []) + (["AI PALETTE"] if slop else []) + (["SOUND SLOP"] if noise else []) + (["SOUND THIN"] if thin else []) + (["SOUND BURIED"] if buried else []) + (["SOUND ALL CODE"] if coded else []) + (["SOUND LATE"] if late else []) + (["FORMAT COPY"] if copied else []) + (["TEXT"] if text else []) + (["OLD CG ROUTE"] if oldcg else []) + (["AV OFFSET"] if avoff else []) + (["ENDING SHORT"] if ending else [])
+        (["EVEN RHYTHM"] if "EVEN RHYTHM" in rhythm else []) + (["LONG END CARD"] if end_card else []) + (["TOO DARK"] if dark else []) + (["BLANK FRAMES"] if blank else []) + (["AI PALETTE"] if slop else []) + (["SOUND SLOP"] if noise else []) + (["SOUND THIN"] if thin else []) + (["SOUND BURIED"] if buried else []) + (["SOUND ALL CODE"] if coded else []) + (["SOUND LATE"] if late else []) + (["FORMAT COPY"] if copied else []) + (["TEXT"] if text else []) + (["OLD CG ROUTE"] if oldcg else []) + (["AV OFFSET"] if avoff else []) + (["ENDING SHORT"] if ending else []) + (["AUDIO LENGTH"] if gap > 1.0 else [])
     passed = delivers(hook, master_ok, rc, avoff or unchosen, weak, a.show_anyway)
     extra = []
     if passed:
@@ -1799,6 +1828,11 @@ def remember_film():
 
 
 def main():
+    here = Path.cwd()
+    if here.resolve() != PROJECT.resolve():       # paths in the steps (--film, the cut to check) are the film's own
+        sys.argv = [sys.argv[0]] + [str((here / v).resolve()) if not v.startswith("-") and not (PROJECT / v).exists()
+                                    and (here / v).exists() else v for v in sys.argv[1:]]
+        os.chdir(PROJECT)
     if len(sys.argv) > 1 and sys.argv[1] in ("stills", "draft", "final", "check"):
         remember_film()
     if len(sys.argv) > 1 and sys.argv[1] == "wait":
@@ -1836,6 +1870,11 @@ def main():
     for tool in ("node", "ffmpeg", "ffprobe"):
         if not shutil.which(tool):
             finish([f"FAILED: {tool} is not installed"], 2)
+    encoders = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"], capture_output=True, text=True).stdout
+    if not re.search(r"^\s*V\S*\s+libx264\b", encoders, re.M):
+        finish(["FAILED: this ffmpeg cannot write H.264 (no libx264 encoder). Fedora: Fedora's own ffmpeg-free leaves it "
+                "out; the full ffmpeg comes from RPM Fusion (ask the user before enabling an outside repository): "
+                "sudo dnf swap ffmpeg-free ffmpeg --allowerasing. Elsewhere: the distribution's full ffmpeg package"], 2)
     stills(a) if a.step == "stills" else render(a, a.step)
 
 

@@ -36,19 +36,26 @@ SHELLS = ("Bash", "PowerShell")              # Windows without Git Bash runs Cla
 
 
 def is_film(d):
-    return (d / "STATE.md").is_file() and any((d / "tools" / q).is_file() for q in ("qc.py", "qc.sh"))
+    try:                                 # before Python 3.14 a folder without search permission raises here
+        return (d / "STATE.md").is_file() and any((d / "tools" / q).is_file() for q in ("qc.py", "qc.sh"))
+    except OSError:
+        return False
+
+
+def subdirs(d):
+    """The visible folders in d (at most 200); an unreadable d has none, so one locked folder hides nothing else."""
+    try:
+        return [c for c in d.iterdir() if not c.name.startswith(".") and c.is_dir()][:200]
+    except OSError:
+        return []
 
 
 def film_near(cwd):
     d = Path(cwd)
     if is_film(d) or any(is_film(p) for p in list(d.parents)[:3]):
         return True
-    try:                                 # the films folder may sit one level down: <cwd>/Filmler/<film>
-        kids = [c for c in d.iterdir() if c.is_dir() and not c.name.startswith(".")][:200]
-        return any(is_film(c) for c in kids) or any(is_film(g) for c in kids for g in list(c.iterdir())[:200]
-                                                     if g.is_dir() and not g.name.startswith("."))
-    except OSError:
-        return False
+    kids = subdirs(d)                    # the films folder may sit one level down: <cwd>/Filmler/<film>
+    return any(is_film(c) for c in kids) or any(is_film(g) for c in kids for g in subdirs(c))
 
 
 def film_above(path):
@@ -75,12 +82,8 @@ def film_of_path(p, cwd):
 
 
 def films_below(cwd):
-    try:
-        kids = [c for c in Path(cwd).iterdir() if c.is_dir() and not c.name.startswith(".")][:200]
-        return [c for c in kids if is_film(c)] + [g for c in kids if not is_film(c)
-                                                  for g in list(c.iterdir())[:200] if g.is_dir() and is_film(g)]
-    except OSError:
-        return []
+    kids = subdirs(Path(cwd))
+    return [c for c in kids if is_film(c)] + [g for c in kids if not is_film(c) for g in subdirs(c) if is_film(g)]
 
 
 def prompt_film(prompt, cwd):

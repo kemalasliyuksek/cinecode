@@ -31,13 +31,14 @@ BREATH_SENTENCE, BREATH_LONG, BREATH_OTHER = 0.20, 0.24, 0.14
 LONG_PAUSE = 2.0
 BEFORE_SHARE = 0.55            # share of the kept breath that stays after the previous word
 HEAD, TAIL, MIN_PIECE = 0.22, 0.34, 0.15    # a piece under ~4 frames reads as a jump and a click: dropped
-FILLERS = {"ıı", "ıı.", "ee", "eee", "hmm", "hm", "ım", "um", "uh", "erm", "ah"}
+FILLERS = {"ii", "ee", "eee", "hmm", "hm", "im", "um", "uh", "erm", "ah"}     # as norm() writes them (ıı, ım)
 STOP = {"ve", "ama", "fakat", "çünkü", "ile", "için", "gibi", "bir", "bu", "şu", "da", "de", "ki", "ya", "ne",
         "the", "and", "but", "for", "with", "that", "this", "you", "are", "was", "not", "then"}
 
 
 def norm(w):
-    w = w.replace("I", "ı").replace("İ", "i").lower()
+    """A word for matching: I, İ, ı and i all as i, so "Internet" meets "internet" and "IŞIK" meets "ışık"."""
+    w = w.replace("İ", "i").replace("I", "i").lower().replace("ı", "i")
     return re.sub(r"[^\wçğıöşü]", "", w)
 
 

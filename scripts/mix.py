@@ -67,6 +67,16 @@ def audit_missing(plan_path):
     return ""
 
 
+
+def num(v):
+    """A plain finite number from a plan value (a bool or text like "0.1,volume=-60dB" is refused)."""
+    if isinstance(v, bool):
+        raise ValueError(v)
+    x = float(v)
+    if x != x or x in (float("inf"), float("-inf")):
+        raise ValueError(v)
+    return x
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("plan")
@@ -77,6 +87,18 @@ def main():
     cuts = cuts_from(plan.get("shots"))
 
     print(f"{'#':>2}  {'at':>6}  {'gain':>6}  {'bus':<9} file")
+    for i, L in enumerate(layers):
+        try:                                            # numbers go into the filter graph: a word there would add a filter
+            for k in ("at", "gain_db", "pan", "fade_in", "fade_out", "length"):
+                if L.get(k) not in (None, "", False):
+                    L[k] = num(L[k])
+            if L.get("trim"):
+                if len(L["trim"]) != 2:
+                    raise ValueError(L["trim"])
+                L["trim"] = [num(x) for x in L["trim"]]
+        except (TypeError, ValueError, IndexError):
+            sys.exit(f"layer {i} ({L.get('file')}): at, gain_db, pan, fade_in, fade_out, length and trim take numbers "
+                     "(seconds or dB)")
     for i, L in enumerate(layers):
         near = [c for c in cuts if abs(c - L.get("at", 0)) < 0.3 and L.get("at", 0) > 0]
         flag = f"  <- {near[0]:.2f} s cut" if near else ""

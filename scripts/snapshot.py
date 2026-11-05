@@ -8,7 +8,7 @@ The film folder has its own local git history (made by init_film.py): nothing is
 (renders, audio, frames) stays out of it (.gitignore). A snapshot is taken only when the film folder is the root of
 its own repository: a film made inside another project's repository (a website, the kit itself) is never committed
 into that project. Without git, or with nothing changed, it does nothing. It never asks for a git identity: the
-snapshot carries a local one. Prints one line; the user is never told about git.
+snapshot carries a local one and is never signed. Prints one line; the user is never told about git.
 """
 import os
 import shutil
@@ -46,8 +46,10 @@ def main():
     if git("diff", "--cached", "--quiet").returncode == 0:      # untracked media (an .mp3) is not a change
         print("snapshot: nothing changed")
         return 0
-    r = subprocess.run(["git", "-c", "user.name=cinecode", "-c", "user.email=cinecode@localhost", "commit", "-q",
-                        "-m", msg], capture_output=True, text=True)
+    # a local history only: the user's signing setup (a key agent, a password prompt) never runs for it, and their
+    # hooks never see it
+    r = subprocess.run(["git", "-c", "user.name=cinecode", "-c", "user.email=cinecode@localhost", "-c", "commit.gpgsign=false",
+                        "-c", f"core.hooksPath={os.devnull}", "commit", "-q", "--no-verify", "-m", msg], capture_output=True, text=True)
     print(f"snapshot: {msg}" if r.returncode == 0 else f"snapshot: skipped ({r.stderr.strip()[:80]})")
     return 0
 

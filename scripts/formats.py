@@ -33,7 +33,7 @@ FORM_LINES = ("Purpose", "Format", "Look", "Director card", "Type", "Sound", "So
 
 
 def slug(name):
-    s = re.sub(r"[^\w-]+", "-", name.strip().lower(), flags=re.UNICODE).strip("-")
+    s = re.sub(r"[^\w-]+", "-", name.strip().replace("İ", "i").replace("I", "ı").lower(), flags=re.UNICODE).strip("-")
     if not s:
         raise SystemExit("give the format a name")
     return s
