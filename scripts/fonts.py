@@ -80,9 +80,14 @@ def fetch(url, dest, max_age_days=30):
         return dest
     req = urllib.request.Request(url, headers={"User-Agent": "cinecode-fonts/1.0"})
     try:
-        with urllib.request.urlopen(req, timeout=60) as r, open(dest + ".part", "wb") as f:
-            f.write(r.read())
-        os.replace(dest + ".part", dest)
+        with urllib.request.urlopen(req, timeout=60) as r:
+            data, want = r.read(), r.headers.get("Content-Length")
+        if want and want.isdigit() and len(data) != int(want):
+            raise OSError(f"incomplete download ({len(data)} of {want} bytes)")
+        part = f"{dest}.{os.getpid()}.part"
+        with open(part, "wb") as f:
+            f.write(data)
+        os.replace(part, dest)
     except OSError as e:
         if not os.path.exists(dest):
             sys.exit(f"fonts: cannot reach {url.split('/')[2]} ({e}); try again online")

@@ -150,7 +150,48 @@ def mark_down(name):
         json.dump(d, fh)
 
 
+MAX_DOWNLOAD = int(os.environ.get("CINECODE_MAX_DOWNLOAD_MB") or 3072) << 20
+LOCAL_THUMB = (".jpg", ".jpeg", ".png", ".webp", ".gif", ".img")
+
+
+def web_url(url):
+    """Only web addresses come from a remote answer: file:, ftp: and ffmpeg's own protocols (concat:, subfile:) are
+    refused, and plain http is asked for over https (every archive here serves it)."""
+    u = urllib.parse.urlparse(str(url))
+    if u.scheme == "http" and u.hostname:
+        return urllib.parse.urlunparse(u._replace(scheme="https"))
+    if u.scheme != "https" or not u.hostname:
+        raise ValueError(f"not a web address: {str(url)[:60]}")
+    return str(url)
+
+
+def download(url, path, timeout=90, limit=None):
+    """A file to path, whole or not at all: a body shorter than its Content-Length (a dropped connection) or longer
+    than the limit leaves nothing behind and raises."""
+    limit = limit or MAX_DOWNLOAD
+    req = urllib.request.Request(web_url(url), headers={"User-Agent": UA, "AIC-User-Agent": UA})   # AIC's image server refuses a file without it
+    got, part = 0, path + ".part"
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp, open(part, "wb") as f:
+            want = str((getattr(resp, "headers", None) or {}).get("Content-Length") or "")
+            want = int(want) if want.isdigit() else None
+            if want and want > limit:
+                raise ValueError(f"{want >> 20} MB, over the {limit >> 20} MB limit (CINECODE_MAX_DOWNLOAD_MB)")
+            while chunk := resp.read(1 << 20):
+                got += len(chunk)
+                if got > limit:
+                    raise ValueError(f"over the {limit >> 20} MB limit (CINECODE_MAX_DOWNLOAD_MB)")
+                f.write(chunk)
+        if want is not None and got != want:
+            raise OSError(f"incomplete download: {got} of {want} bytes")
+        os.replace(part, path)
+    finally:
+        if os.path.exists(part):
+            os.remove(part)
+
+
 def get(url, as_json=True):
+    url = web_url(url)
     key = hashlib.sha1(url.encode()).hexdigest()
     path = os.path.join(CACHE, key)
     if os.path.exists(path):
@@ -560,15 +601,16 @@ DEFAULT = {"image": "wikimedia,aic,cleveland,nasa,pixabay", "sound": "wikimedia,
 
 
 def contact_sheet(results, out):
-    thumbs, shown = [], []
-    os.makedirs(os.path.join(out, "thumbs"), exist_ok=True)
+    thumbs, shown, tiles = [], [], []          # tiles: every result in order, None where its thumb is missing, so a
+    os.makedirs(os.path.join(out, "thumbs"), exist_ok=True)   # tile's place on the sheet is always its number
     for r in results:
         if not r.get("thumb"):
+            tiles.append(None)
             continue
         p = os.path.join(out, "thumbs", f"{r['n']:02d}.img")
         src = r["thumb"]
         try:
-            if os.path.exists(src):                  # a local file (the user's refs/): read it, never download it
+            if os.path.isfile(src) and src.lower().endswith(LOCAL_THUMB):   # a local picture (the user's refs/): read it, never download it
                 data = None
                 if os.path.abspath(src) != os.path.abspath(p):
                     with open(src, "rb") as source:
@@ -581,21 +623,24 @@ def contact_sheet(results, out):
                 os.replace(p + ".part", p)
             thumbs.append(p)
             shown.append(r["n"])
+            tiles.append(p)
         except Exception as e:
-            print(f"thumb {r['n']}: skipped ({str(e)[:80]})")
+            tiles.append(None)
+            print(f"thumb {r['n']}: no picture, its tile stays dark ({str(e)[:80]})")
     if not thumbs:
         return None
     try:
-        cols = min(4, len(thumbs))
-        rows = (len(thumbs) + cols - 1) // cols
+        while tiles and tiles[-1] is None:      # nothing after the last picture to keep in place
+            tiles.pop()
+        cols = min(4, len(tiles))
         cmd = ["ffmpeg", "-v", "error", "-y"]
-        for p in thumbs:
-            cmd += ["-i", p]
+        for p in tiles:
+            cmd += ["-i", p] if p else ["-f", "lavfi", "-i", "color=c=0x262626:s=200x200"]
         f = "".join(f"[{i}]scale=200:200:force_original_aspect_ratio=decrease,pad=200:200:(ow-iw)/2:(oh-ih)/2,setsar=1[t{i}];"
-                    for i in range(len(thumbs)))
-        layout = "|".join(f"{(i % cols) * 200}_{(i // cols) * 200}" for i in range(len(thumbs)))
-        f += "".join(f"[t{i}]" for i in range(len(thumbs))) + \
-            (f"xstack=inputs={len(thumbs)}:layout={layout}:fill=black" if len(thumbs) > 1 else "null")
+                    for i in range(len(tiles)))
+        layout = "|".join(f"{(i % cols) * 200}_{(i // cols) * 200}" for i in range(len(tiles)))
+        f += "".join(f"[t{i}]" for i in range(len(tiles))) + \
+            (f"xstack=inputs={len(tiles)}:layout={layout}:fill=black" if len(tiles) > 1 else "null")
         sheet = os.path.join(out, "sheet.jpg")
         subprocess.run(cmd + ["-filter_complex", f, "-frames:v", "1", "-q:v", "5", sheet], check=True,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -839,16 +884,22 @@ def file_url(r, variant):
 def preview(url, path, secs):
     """The first `secs` of a track: ffmpeg reads the stream and stops, so the rest is never downloaded; without
     ffmpeg, the first bytes (about 30 s of a 320 kbps MP3 per 1.2 MB)."""
+    local = os.path.isfile(url)                  # a track already on this disk; anything else is a web address
+    url = url if local else web_url(url)
     if shutil.which("ffmpeg"):
-        agent = ["-user_agent", UA] if url.startswith("http") else []
+        agent = ["-protocol_whitelist", "file"] if local else ["-user_agent", UA, "-protocol_whitelist", "https,tls,tcp"]
         fmt = {".mka": "matroska", ".oga": "ogg", ".m4a": "ipod"}.get(os.path.splitext(path)[1], None)
         subprocess.run(["ffmpeg", "-v", "error", "-y", *agent, "-t", str(secs), "-i", url, "-map", "0:a:0", "-c", "copy",
                         *(["-f", fmt] if fmt else []), path + ".part" + os.path.splitext(path)[1]], check=True, timeout=120)
         os.replace(path + ".part" + os.path.splitext(path)[1], path)
         return
-    req = urllib.request.Request(url, headers={"User-Agent": UA, "Range": f"bytes=0-{int(secs * 40000)}"})
-    with urllib.request.urlopen(req, timeout=60) as resp, open(path + ".part", "wb") as f:
-        f.write(resp.read())
+    if local:
+        with open(url, "rb") as src, open(path + ".part", "wb") as f:
+            f.write(src.read(int(secs * 40000)))
+    else:
+        req = urllib.request.Request(url, headers={"User-Agent": UA, "Range": f"bytes=0-{int(secs * 40000)}"})
+        with urllib.request.urlopen(req, timeout=60) as resp, open(path + ".part", "wb") as f:
+            f.write(resp.read())
     os.replace(path + ".part", path)
 
 
@@ -874,6 +925,15 @@ def used_lately(results):
         return results, {}
     used = sounds.recent()
     return sorted(results, key=lambda r: f"{r['source']}:{r['id']}" in used), used
+
+
+def logged(licenses, path):
+    """The file already has its row in LICENSES.csv."""
+    try:
+        with open(licenses, newline="", encoding="utf-8") as f:
+            return any(os.path.abspath(row.get("file") or "") == os.path.abspath(path) for row in csv.DictReader(f))
+    except OSError:
+        return False
 
 
 def fetch(a):
@@ -904,7 +964,8 @@ def fetch(a):
             ext = os.path.splitext(urllib.parse.urlparse(url).path)[1][:6] or ".bin"
             slug = re.sub(r"[^a-z0-9]+", "-", r["title"].lower()).strip("-")[:40] or "asset"
             path = os.path.join(a.dest, f"{r['source']}-{r['id']}-{slug}{ext}".replace("/", "-"))
-            if os.path.exists(path):
+            here = os.path.exists(path)
+            if here and logged(a.licenses, path):
                 print(f"{n}: already here: {path}")
                 fails.pop(r["source"], None)
                 continue
@@ -917,15 +978,13 @@ def fetch(a):
                 fails.pop(r["source"], None)
                 continue
             shared = sound_cache(r, ext)
-            if shared and shared.exists():
+            if here:
+                print(f"{n}: already here, its licence row was missing: {path}")
+            elif shared and shared.exists():
                 shutil.copyfile(shared, path)
                 print(f"{n}: from the shared sound cache (downloaded for an earlier film)")
             else:
-                req = urllib.request.Request(url, headers={"User-Agent": UA, "AIC-User-Agent": UA})   # AIC's image server refuses a file without it
-                with urllib.request.urlopen(req, timeout=90) as resp, open(path + ".part", "wb") as f:
-                    while chunk := resp.read(1 << 20):
-                        f.write(chunk)
-                os.replace(path + ".part", path)
+                download(url, path)
                 if shared:
                     shared.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copyfile(path, shared)
@@ -950,18 +1009,20 @@ def fetch(a):
         fails.pop(r["source"], None)
         lic = {"cc0": "CC0", "pd": "Public domain", "cc-by": "CC BY", "cc-by-sa": "CC BY-SA", "nasa": "Courtesy NASA",
                "pixabay": "Pixabay Content License"}[r["licence"]]
-        rows.append({"file": path, "title": r["title"], "author": r["creator"], "source_url": r["page"],
+        row = ({"file": path, "title": r["title"], "author": r["creator"], "source_url": r["page"],
                      "licence": r["licence"], "licence_url": r.get("licence_url") or LIC_URL[r["licence"]],
                      "attribution_text": r.get("attribution") or f'"{r["title"]}" by {r["creator"]}, {SOURCE_NAME[r["source"]]}, {lic}',
                      "modifications": "", "downloaded_at": datetime.date.today().isoformat(), "used_in": "",
                      "notes": f"type={r['type']}; source={r['source']}" + (f"; via {r['provider']}" if r.get("provider") else "")})
-        print(f"{n}: {path} · {r['licence']}")
-    if rows:
-        with open(a.licenses, "a", newline="", encoding="utf-8") as f:
+        with open(a.licenses, "a", newline="", encoding="utf-8") as f:   # at once: a stopped fetch keeps every row
             w = csv.DictWriter(f, fieldnames=FIELDS)
             if new:
                 w.writeheader()
-            w.writerows(rows)
+                new = False
+            w.writerow(row)
+        rows.append(row)
+        print(f"{n}: {path} · {r['licence']}")
+    if rows:
         print(f"logged {len(rows)} row(s) in {a.licenses}; fill 'used_in' and 'modifications' when used")
 
 

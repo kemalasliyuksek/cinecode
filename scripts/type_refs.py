@@ -68,6 +68,9 @@ def _robots_ok(url):
     return _robots[base].can_fetch(UA, url)
 
 
+MAX_PAGE = 8 << 20
+
+
 def _raw(url):
     host = _host(url)
     rp = _robots.get(f"{urllib.parse.urlsplit(url).scheme}://{urllib.parse.urlsplit(url).netloc}")
@@ -80,7 +83,10 @@ def _raw(url):
         _last[host] = time.time()
         try:
             with urllib.request.urlopen(req, timeout=25) as r:
-                return r.read()
+                data = r.read(MAX_PAGE + 1)
+            if len(data) > MAX_PAGE:
+                raise RuntimeError(f"over {MAX_PAGE >> 20} MB: not a page or a thumbnail")
+            return data
         except urllib.error.HTTPError as e:
             if e.code in (429, 503) and attempt < 2:
                 time.sleep(min(30, float(e.headers.get("Retry-After") or 5 * (attempt + 1))))
@@ -141,6 +147,8 @@ def src_fontsinuse(q, n):
     m = re.match(r"(format|topic):([\w-]+)\s*(.*)", q.strip())
     if q.startswith("http"):
         url, rest = q.split()[0], " ".join(q.split()[1:])
+        if urllib.parse.urlsplit(url).scheme != "https" or _host(url) != "fontsinuse.com":
+            raise RuntimeError("only a fontsinuse.com address (https) is read here")
     elif m and m.group(1) == "format" and m.group(2) in FIU_FORMATS:
         url, rest = f"{base}/in/2/formats/{FIU_FORMATS[m.group(2)]}/{m.group(2)}", m.group(3)
     elif m and m.group(1) == "topic" and m.group(2) in FIU_TOPICS:

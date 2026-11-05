@@ -142,10 +142,18 @@ def fetch(rel, src="mg"):
     if os.path.exists(dst) and os.path.getsize(dst) > 0:
         return dst
     os.makedirs(os.path.dirname(dst), exist_ok=True)
-    with urllib.request.urlopen(urllib.request.Request(raw_url(src, rel), headers=UA), timeout=60) as r, \
-            open(dst + ".part", "wb") as f:
-        shutil.copyfileobj(r, f)
-    os.replace(dst + ".part", dst)
+    part = f"{dst}.{os.getpid()}.part"            # two chats filling the shared cache never write one file
+    try:
+        with urllib.request.urlopen(urllib.request.Request(raw_url(src, rel), headers=UA), timeout=60) as r, \
+                open(part, "wb") as f:
+            shutil.copyfileobj(r, f)
+            want = r.headers.get("Content-Length")
+        if want and want.isdigit() and os.path.getsize(part) != int(want):
+            raise OSError(f"incomplete download: {rel}")
+        os.replace(part, dst)
+    finally:
+        if os.path.exists(part):
+            os.remove(part)
     return dst
 
 
@@ -239,16 +247,19 @@ def head_wav(src, rel, secs, dst):
     want = data + int(secs * rate)
     with urllib.request.urlopen(urllib.request.Request(url, headers={**UA, "Range": f"bytes=0-{want - 1}"}), timeout=120) as r:
         body = bytearray(r.read())
+        sent = r.headers.get("Content-Length")
+    if sent and sent.isdigit() and len(body) != int(sent):
+        raise OSError(f"incomplete download: {rel}")
     body[data - 4:data] = struct.pack("<I", len(body) - data)
     body[4:8] = struct.pack("<I", len(body) - 8)
-    tmp = dst + ".part.wav"
+    tmp = f"{dst}.{os.getpid()}.part.wav"
     open(tmp, "wb").write(body)
     fade = max(0.05, min(0.6, secs * 0.15))
     subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", tmp, "-ac", "1", "-ar", "44100", "-sample_fmt", "s16",
                     "-af", f"afade=t=out:st={max(0, secs - fade):.2f}:d={fade:.2f}", "-c:a", "flac",
-                    "-compression_level", "8", "-f", "flac", dst + ".part"], check=True)
+                    "-compression_level", "8", "-f", "flac", f"{dst}.{os.getpid()}.part"], check=True)
     os.remove(tmp)
-    os.replace(dst + ".part", dst)
+    os.replace(f"{dst}.{os.getpid()}.part", dst)
 
 
 def levels(path):

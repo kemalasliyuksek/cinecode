@@ -219,9 +219,17 @@ def fetch(url, dest):
         return dest
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     req = urllib.request.Request(url, headers={"User-Agent": "cinecode-styles/1.0"})
-    with urllib.request.urlopen(req, timeout=30) as r, open(dest + ".part", "wb") as f:
-        shutil.copyfileobj(r, f)
-    os.replace(dest + ".part", dest)
+    part = f"{dest}.{os.getpid()}.part"
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r, open(part, "wb") as f:
+            shutil.copyfileobj(r, f)
+            want = r.headers.get("Content-Length")
+        if want and want.isdigit() and os.path.getsize(part) != int(want):
+            raise OSError(f"incomplete download: {url}")
+        os.replace(part, dest)
+    finally:
+        if os.path.exists(part):
+            os.remove(part)
     return dest
 
 
@@ -297,6 +305,33 @@ def chrome():
                                           "microsoft-edge") if shutil.which(n)), None)
 
 
+CHROME_TMPDIR_MAX = 58     # Chrome aborts when TMPDIR/<brand>.XXXXXX/SingletonSocket passes the socket path limit
+
+
+def chrome_shot(exe, args, timeout=60):
+    """One headless Chrome run in a short temp folder of its own: Chrome aborts on a TMPDIR too long for its socket
+    path ("Socket path too long"), and a fresh profile keeps the user's own Chrome out of it."""
+    import tempfile
+    base = tempfile.gettempdir()
+    roots = ([base] if os.name == "nt" or len(base) <= CHROME_TMPDIR_MAX - 24 else []) + \
+        [r for r in ("/tmp", os.environ.get("XDG_RUNTIME_DIR"), "/var/tmp") if r and os.name != "nt"]
+    home = None
+    for root in roots:
+        try:
+            home = tempfile.mkdtemp(prefix="cinecode-shot-", dir=root)
+            break
+        except OSError:
+            continue
+    env = dict(os.environ, TMPDIR=home) if home and os.name != "nt" else None
+    try:
+        return subprocess.run([exe, "--headless=new", "--no-first-run", "--no-default-browser-check", "--mute-audio",
+                               *([f"--user-data-dir={home}"] if home else []), *args],
+                              capture_output=True, timeout=timeout, env=env)
+    finally:
+        if home:
+            shutil.rmtree(home, ignore_errors=True)
+
+
 def short(text, n):
     return text if len(text) <= n else text[:n].rsplit(" ", 1)[0].rstrip(",;:") + "…"
 
@@ -330,9 +365,8 @@ def html_board(picks, files, cols, w, h, out):
         src, png = os.path.join(tmp, "board.html"), os.path.join(tmp, "board.png")
         open(src, "w", encoding="utf-8").write(page)
         W, Hh = cols * (w + 8) - 8, rows * (h + cap + 8) - 8
-        r = subprocess.run([exe, "--headless=new", "--disable-gpu", "--hide-scrollbars", "--allow-file-access-from-files",
-                            f"--window-size={W},{Hh}", f"--screenshot={png}", Path(src).resolve().as_uri()],
-                           capture_output=True, timeout=60)
+        r = chrome_shot(exe, ["--disable-gpu", "--hide-scrollbars", f"--window-size={W},{Hh}", f"--screenshot={png}",
+                              Path(src).resolve().as_uri()])
         if r.returncode != 0 or not os.path.exists(png):
             return False
         os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)

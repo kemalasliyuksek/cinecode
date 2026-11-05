@@ -237,9 +237,8 @@ def labelled_board(styles, rows, width, out):
     with tempfile.TemporaryDirectory() as tmp:
         src, png = os.path.join(tmp, "board.html"), os.path.join(tmp, "board.png")
         open(src, "w", encoding="utf-8").write(page)
-        r = subprocess.run([exe, "--headless=new", "--disable-gpu", "--hide-scrollbars", "--allow-file-access-from-files",
-                            f"--window-size={width},{total}", f"--screenshot={png}", Path(src).resolve().as_uri()],
-                           capture_output=True, timeout=60)
+        r = styles.chrome_shot(exe, ["--disable-gpu", "--hide-scrollbars", f"--window-size={width},{total}",
+                                     f"--screenshot={png}", Path(src).resolve().as_uri()])
         if r.returncode != 0 or not os.path.exists(png):
             return False
         subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", png, "-q:v", "4", out], check=True)
