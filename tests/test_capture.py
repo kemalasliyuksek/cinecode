@@ -147,6 +147,23 @@ class Browser(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertTrue((self.root / "frames/000000.png").is_file())
 
+    def test_the_page_reads_its_film_and_nothing_else_on_the_disk(self):
+        outside = Path(self.tmp.name).parent / f"{Path(self.tmp.name).name}-outside.txt"
+        outside.write_text("SECRET", encoding="utf-8")
+        self.addCleanup(outside.unlink)
+        (self.root / "assets" / "note.txt").write_text("FILM", encoding="utf-8")
+        reads = {"own": "assets/note.txt", "up": f"../{outside.name}", "file": outside.as_uri(),
+                 "abs": outside.as_posix()}
+        page = ("<!doctype html><script>const read=(u)=>fetch(u).then(r=>r.ok?r.text():'blocked',()=>'blocked');"
+                "window.captureFrame=()=>'data:,';window.READY=Promise.all(" + json.dumps(list(reads.values())) +
+                ".map(read)).then(t=>({frames:1,fps:1,width:1,height:1,renderer:'test',title:t.join('|')}));</script>")
+        (self.root / "reads.html").write_text(page, encoding="utf-8")
+        result = invoke(["--url", "reads.html", "--probe"], self.root)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        got = dict(zip(reads, json.loads(result.stdout.split("meta: ", 1)[1].splitlines()[0])["title"].split("|")))
+        self.assertEqual(got, {"own": "FILM", "up": "blocked", "file": "blocked", "abs": "blocked"})
+        self.assertIn("nothing else on the disk is read", result.stderr)
+
     def test_status_file_does_not_invalidate_inputs(self):
         self.cap("--status", "progress.json")
         self.assertIn("0 rendered, 1 skipped", self.cap("--status", "progress.json").stdout)

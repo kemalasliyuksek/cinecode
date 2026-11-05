@@ -103,7 +103,7 @@ python3 tools/scene_check.py action renders/film-v1.mp4 --shots shots.json   # t
 | `--probe` says SwiftShader / llvmpipe | no GPU in headless mode: on Linux try `--flags "--use-angle=vulkan --enable-features=Vulkan"`; on Windows set Chrome to "High performance" in the graphics settings; or render on another machine |
 | `page never defined window.READY` with an error, or `the page threw while loading` | a script or shader error, with its file and line: fix that line |
 | `SyntaxError: Unary operator used immediately before exponentiation` | JavaScript refuses `-x ** 2`: write `-(x ** 2)` or `x * x` |
-| module or texture fails on `file://` | serve the folder: `python3 -m http.server 8000`, then `--url http://localhost:8000/engine/scene.html` |
+| a module, texture or sound does not load | `capture.mjs` serves the film's own folder over 127.0.0.1 and prints what the page asked for and did not get (`not found in the film folder`): name every file from the film folder, and copy a file from elsewhere into `assets/` or `audio/` first |
 | `--verify` says DIFFERENT | wall-clock time, `Math.random`, state carried between frames, assets loading late |
 | `READY` fails with "Cannot access 'SEED' before initialization", or seeded data comes out the same for every seed | seeded data built at the top level before `SEED` is set: build it lazily on first use (`lazy()`, `looks.md` §7) |
 | diacritics or descenders cut off in a text box | size the box from the font's ascent and descent plus padding (`label()`); test with `İĞÜŞÖÇ ÉÅ Ñ` |

@@ -1522,7 +1522,7 @@ function sample(ctx, out, name, t, o = {}) {
   return src;
 }
 
-function loadAudio(ctx, url) {              // a local WAV next to film.html (XHR works on file:// in the capture)
+function loadAudio(ctx, url) {              // a sound in the film folder (the capture serves only that folder)
   return new Promise((ok, fail) => {
     const x = new XMLHttpRequest(); x.open('GET', url.replace(/#/g, '%23')); x.responseType = 'arraybuffer';
     x.onload = () => (x.status === 0 || x.status === 200) ? ctx.decodeAudioData(x.response).then(ok, fail)

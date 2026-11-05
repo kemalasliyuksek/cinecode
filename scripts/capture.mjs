@@ -26,6 +26,8 @@
 //                                      written as a 32-bit float WAV (no clipping; master it afterwards).
 //                                      Works alone (audio only) or together with --out / --video.
 // Env: CHROME_PATH=/path/to/chrome to override browser discovery. A TMPDIR too long for Chrome's socket is handled here.
+// A local page is served from its film folder (the nearest folder with STATE.md, else the page's own) over 127.0.0.1:
+// the page reads the film's files and nothing else on the disk.
 // Local frames resume when page/params/loaded local file contents match (not with --video). --fresh regenerates them.
 // HTTP pages render afresh. Local pages with changed unpinned remote assets should use --fresh.
 //
@@ -35,10 +37,21 @@
 
 import { spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, readdirSync, rmSync, statSync, writeFileSync, writeSync, renameSync } from 'node:fs';
+import { closeSync, createReadStream, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readSync, readdirSync, rmSync, statSync, writeFileSync, writeSync, renameSync } from 'node:fs';
+import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+
+// Read by the film's server while the page loads, so defined before the first await.
+const TYPES = { '.html': 'text/html', '.htm': 'text/html', '.js': 'text/javascript', '.mjs': 'text/javascript',
+  '.json': 'application/json', '.css': 'text/css', '.svg': 'image/svg+xml', '.png': 'image/png', '.jpg': 'image/jpeg',
+  '.jpeg': 'image/jpeg', '.webp': 'image/webp', '.gif': 'image/gif', '.avif': 'image/avif', '.wav': 'audio/wav',
+  '.mp3': 'audio/mpeg', '.ogg': 'audio/ogg', '.oga': 'audio/ogg', '.opus': 'audio/ogg', '.flac': 'audio/flac',
+  '.m4a': 'audio/mp4', '.aac': 'audio/aac', '.mp4': 'video/mp4', '.m4v': 'video/mp4', '.mov': 'video/quicktime',
+  '.webm': 'video/webm', '.woff2': 'font/woff2', '.woff': 'font/woff', '.ttf': 'font/ttf', '.otf': 'font/otf',
+  '.txt': 'text/plain', '.csv': 'text/csv', '.srt': 'text/plain', '.vtt': 'text/vtt', '.glb': 'model/gltf-binary',
+  '.gltf': 'model/gltf+json', '.hdr': 'application/octet-stream', '.exr': 'application/octet-stream' };
 
 const args = parseArgs(process.argv.slice(2));
 if (args.help || args.h) { usage(null); }
@@ -109,8 +122,17 @@ process.on('exit', () => {
   for (const d of profiles) { try { rmSync(d, { recursive: true, force: true }); } catch { /* best effort */ } }
 });
 
+const served = new Set();                             // the film's files the page loaded (the resume stamp hashes them)
+const refused = new Set(), missing = new Set();       // what it asked for outside its folder, or what is not there
+let server = null;
+process.on('exit', () => {
+  if (refused.size) console.error(`[capture] the page asked for files outside its film folder (refused): ${[...refused].slice(0, 5).join(', ')}; copy them into the film (assets/, audio/) and name them from there`);
+  if (missing.size) console.error(`[capture] not found in the film folder: ${[...missing].slice(0, 5).join(', ')} (the page names its files from the film folder; nothing else on the disk is read: copy a file in to use it)`);
+});
+const chromeUrl = pageUrl.startsWith('file:') ? await serve(pageUrl) : pageUrl;
+
 const t0 = Date.now();
-const first = await openPage(chrome, pageUrl);
+const first = await openPage(chrome, chromeUrl);
 const info = await first.ready();
 if (!info || !['frames', 'width', 'height'].every((k) => Number.isSafeInteger(info[k]) && info[k] > 0) ||
     !Number.isFinite(info.fps) || info.fps <= 0) {
@@ -210,7 +232,7 @@ const n = Math.min(workers, total);
 const chunks = Array.from({ length: n }, (_, w) => list.map((_, k) => k).filter((k) => k % n === w));   // positions in list
 const pages = [first];
 for (let i = 1; i < chunks.length; i++) {
-  const p = await openPage(chrome, pageUrl);
+  const p = await openPage(chrome, chromeUrl);
   await p.ready();
   pages.push(p);
 }
@@ -261,6 +283,7 @@ try {
   for (const p of pages) await p.close();
 }
 if (enc) await enc.finish();
+if (server) { server.closeAllConnections?.(); server.close(); }
 const secs = (Date.now() - t0) / 1000;
 progress();
 Object.assign(status, { state: 'done', eta_s: 0, seconds: +secs.toFixed(1), finished_at: new Date().toISOString(),
@@ -345,7 +368,7 @@ function pageStamp(page) {
   if (!pageUrl.startsWith('file:')) return null;
   const h = createHash('sha256').update(JSON.stringify([pageUrl, format, quality]));
   const buffer = Buffer.allocUnsafe(1024 * 1024);
-  for (const file of page.localFiles()) {
+  for (const file of [...served].sort()) {
     h.update('\0').update(file).update('\0');
     const fd = openSync(file, 'r');
     try {
@@ -383,7 +406,6 @@ async function openPage(chromePath, url) {
     '--use-mock-keychain', '--password-store=basic',   // never ask the system keychain (a macOS dialog)
     '--hide-scrollbars', '--enable-gpu', '--ignore-gpu-blocklist',
     '--disable-background-timer-throttling', '--disable-renderer-backgrounding',
-    '--allow-file-access-from-files',
   ];
   if (process.platform === 'darwin') flags.push('--use-angle=metal');
   flags.push(...extraFlags);
@@ -425,15 +447,12 @@ async function openPage(chromePath, url) {
   const pending = new Map();
   const pageErrors = [];
   const pageExceptions = [];
-  const loadedUrls = new Set([url]);
   ws.onmessage = (m) => {
     const msg = JSON.parse(typeof m.data === 'string' ? m.data : m.data.toString());
     if (msg.id && pending.has(msg.id)) {
       const { ok, fail } = pending.get(msg.id);
       pending.delete(msg.id);
       msg.error ? fail(new Error(msg.error.message)) : ok(msg.result);
-    } else if (msg.method === 'Network.responseReceived' && msg.params.response.status >= 200 && msg.params.response.status < 400) {
-      loadedUrls.add(msg.params.response.url);
     } else if (msg.method === 'Runtime.exceptionThrown') {
       const d = msg.params.exceptionDetails;
       const where = d.url ? ` (${decodeURIComponent(d.url.split('/').pop())}:${(d.lineNumber ?? 0) + 1})` : '';
@@ -478,9 +497,6 @@ async function openPage(chromePath, url) {
   }
 
   return {
-    localFiles() {
-      return [...new Set([...loadedUrls].filter((u) => u.startsWith('file:')).map((u) => fileURLToPath(new URL(u))))].sort();
-    },
     async eval(expression, ms = EVAL_MS) {
       const r = await send('Runtime.evaluate', { expression, awaitPromise: true, returnByValue: true }, ms);
       if (r.exceptionDetails) throw new Error(`page error: ${r.exceptionDetails.exception?.description ?? r.exceptionDetails.text}`);
@@ -543,6 +559,55 @@ function findChrome() {
   const found = candidates.find((p) => existsSync(p));
   if (!found) usage('no Chrome/Chromium found; set CHROME_PATH');
   return found;
+}
+
+// The film's folder over 127.0.0.1 on a free port: read-only, nothing above the folder, ranges for video seeking.
+async function serve(fileUrl) {
+  const page = fileURLToPath(new URL(fileUrl));
+  let root = dirname(page);
+  for (let d = root, i = 0; i < 4; i++, d = dirname(d)) {
+    if (existsSync(join(d, 'STATE.md'))) { root = d; break; }
+    if (dirname(d) === d) break;
+  }
+  server = createServer((req, res) => {
+    try {
+      if (req.method !== 'GET' && req.method !== 'HEAD') { res.writeHead(405).end(); return; }
+      const asked = decodeURIComponent(new URL(req.url, 'http://127.0.0.1').pathname);
+      const file = resolve(root, '.' + asked);
+      const inside = relative(root, file);
+      if (inside.startsWith('..') || isAbsolute(inside) || asked.includes('\0')) {
+        refused.add(asked); res.writeHead(403).end(); return;
+      }
+      let st;
+      try { st = statSync(file); } catch { st = null; }
+      if (!st || !st.isFile()) {
+        if (!/favicon\.ico$/.test(asked)) missing.add(asked);
+        res.writeHead(404).end(); return;
+      }
+      served.add(file);
+      const head = { 'Content-Type': TYPES[extname(file).toLowerCase()] ?? 'application/octet-stream',
+        'Cache-Control': 'no-store', 'Accept-Ranges': 'bytes' };
+      const range = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range ?? '');
+      let start = 0, end = st.size - 1, code = 200;
+      if (range && (range[1] || range[2])) {
+        start = range[1] ? +range[1] : Math.max(0, st.size - +range[2]);
+        end = range[1] && range[2] ? Math.min(+range[2], st.size - 1) : st.size - 1;
+        if (start > end || start >= st.size) { res.writeHead(416, { 'Content-Range': `bytes */${st.size}` }).end(); return; }
+        code = 206; head['Content-Range'] = `bytes ${start}-${end}/${st.size}`;
+      }
+      head['Content-Length'] = st.size ? end - start + 1 : 0;
+      res.writeHead(code, head);
+      if (req.method === 'HEAD' || !st.size) { res.end(); return; }
+      createReadStream(file, { start, end }).on('error', () => res.destroy()).pipe(res);
+    } catch {
+      res.writeHead(400).end();
+    }
+  });
+  await new Promise((ok, fail) => { server.once('error', fail); server.listen(0, '127.0.0.1', ok); });
+  server.unref();
+  const u = new URL(fileUrl);
+  const path = relative(root, page).split(sep).map(encodeURIComponent).join('/');
+  return `http://127.0.0.1:${server.address().port}/${path}${u.search}`;
 }
 
 function buildUrl(u, params) {

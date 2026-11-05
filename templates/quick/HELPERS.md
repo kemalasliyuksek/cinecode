@@ -79,4 +79,4 @@ Two traps that cost minutes: JavaScript refuses `-x ** 2` (a syntax error that s
 - `function wet(ctx, out, amount)`: Send a voice to the room: wet(ctx, out, 0.3) returns a node that feeds the dry bus and the shared reverb.
 - `function spans(part)`: Arrangement helpers. spans(part): [from, to) runs where the part plays, neighbouring sections merged (one voice per run). beats(part, every): grid times inside those runs, half-open, so a boundary beat is played once.
 - `function beats(part, every = 60 / BPM)`: the beat times where an ARRANGEMENT part plays (half-open lists, so nothing doubles)
-- `function loadAudio(ctx, url)`: a local WAV next to film.html (XHR works on file:// in the capture)
+- `function loadAudio(ctx, url)`: a sound file in the film folder, named from it (`audio/music.wav`); the capture serves only that folder
